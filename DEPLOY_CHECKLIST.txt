@@ -1,0 +1,10 @@
+SUBMISSION CHECKLIST
+[ ] Project pushed to GitHub
+[ ] Render service deployed successfully
+[ ] LLM_API_KEY added in Render environment settings
+[ ] GET https://YOUR-SERVICE.onrender.com/health returns {"status":"ok"}
+[ ] Endpoint URL ends with /v1/mailroom/actions
+[ ] No credentials, query string, or fragment in URL
+[ ] Only then press Check
+[ ] Fix errors based on Render logs / grader feedback
+[ ] Press Save only when ready (last check is reserved for Save)
