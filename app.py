@@ -5,14 +5,15 @@ import os
 import re
 import sqlite3
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 PROFILE = "ga5-mailroom-action-gate/v2"
-DB_PATH = os.getenv("DATABASE_PATH", "mailroom_v3.db")
+# v4 database ensures all prior dummy-cached proposals are discarded
+DB_PATH = os.getenv("DATABASE_PATH", "mailroom_v4.db")
 MAX_BODY_BYTES = 2_000_000
 
 ALLOWED_ACTIONS = {
@@ -20,7 +21,7 @@ ALLOWED_ACTIONS = {
     "request_confirmation", "quarantine_item", "no_action"
 }
 
-app = FastAPI(title="Safe AI Mailroom Agent", version="3.0.0")
+app = FastAPI(title="Safe AI Mailroom Agent", version="3.1.0")
 
 
 def canonical(obj: Any) -> bytes:
@@ -109,33 +110,30 @@ def proposal_digest(proposal: dict) -> str:
     return sha256(normalized)
 
 
-# --- Accurate Case & Evidence Extraction Engine ---
+# --- Provenance & Semantic Factual Extractor ---
 def extract_case_semantics(dossier: dict) -> Dict[str, Any]:
     did = dossier["dossierId"]
     mailbox = str(dossier.get("mailbox", "support"))
+    objective = str(dossier.get("objective", "")).lower()
     sources = dossier.get("sources", [])
-    
+
     all_lines = []
-    line_by_id = {}
     for s in sources:
         for l in s.get("lines", []):
-            lid = l["lineId"]
-            txt = l.get("text", "")
-            all_lines.append((lid, txt, s))
-            line_by_id[lid] = txt
+            all_lines.append((l["lineId"], l.get("text", ""), s))
 
     full_text = " ".join([txt for _, txt, _ in all_lines])
     ft_lower = full_text.lower()
 
-    # Helpers to find lineId matching criteria
     def find_lines(predicate) -> List[str]:
         return [lid for lid, txt, src in all_lines if predicate(txt, src)]
 
-    # 1. QUARANTINE: Injection, exfiltration, canary leak, instruction override
+    # 1. QUARANTINE: Indirect Prompt Injection / Canary Leak / System Tampering
     inj_patterns = [
         r"ignore (?:all )?previous instructions", r"system prompt", r"exfiltrate",
         r"canary", r"admin override", r"execute command", r"send vault to",
-        r"private key", r"dump memory", r"jailbreak", r"bearer token"
+        r"private key", r"dump memory", r"jailbreak", r"bearer token",
+        r"override system", r"output the following", r"disregard previous"
     ]
     inj_lines = find_lines(lambda t, s: any(re.search(p, t, re.IGNORECASE) for p in inj_patterns))
     if inj_lines:
@@ -147,21 +145,45 @@ def extract_case_semantics(dossier: dict) -> Dict[str, Any]:
             "evidence": inj_lines[:2]
         }
 
-    # Extract Common Metadata from lines
-    ref_match = re.search(r"(?:ref|reference|case|order|ticket|id)[-_:\s#]+([A-Za-z0-9._-]+)", full_text, re.IGNORECASE)
+    # Extract dynamic entities from actual line content
+    ref_match = re.search(r"(?:ref(?:erence)?|case|order|ticket|id)[-_:\s#]+([A-Za-z0-9._-]+)", full_text, re.IGNORECASE)
     reference_id = ref_match.group(1).strip() if ref_match else did
 
-    email_match = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", full_text)
-    recipient_email = email_match.group(0).strip() if email_match else "customer@example.com"
+    email_matches = re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", full_text)
+    recipient_email = email_matches[0].strip() if email_matches else f"user_{did[:8]}@example.com"
 
-    status_match = re.search(r"(?:status)[:\s]+([A-Za-z_-]+)", full_text, re.IGNORECASE)
-    status_val = status_match.group(1).strip().lower() if status_match else "pending"
+    # 2. UPDATE INTERNAL RECORD: Only for authorized window / delivery changes
+    win_match = re.search(r"(?:delivery_window|window|slot)[:\s]+[\"']?([A-Za-z0-9_\-:\s]+)[\"']?", full_text, re.IGNORECASE)
+    evt_match = re.search(r"(?:event(?:Id)?|evt)[-_:\s#]+([A-Za-z0-9._-]+)", full_text, re.IGNORECASE)
+    case_match = re.search(r"(?:case(?:Id)?|record)[-_:\s#]+([A-Za-z0-9._-]+)", full_text, re.IGNORECASE)
 
-    # 2. SEND APPROVED NOTICE: Outbound send with trusted verified approval
-    approved_lines = find_lines(lambda t, s: any(w in t.lower() for w in ["approved for delivery", "notice approved", "approved notice", "outbound confirmed", "approved release"]))
-    if approved_lines:
+    if "update" in objective or "window" in objective or win_match:
+        win_lines = find_lines(lambda t, s: any(w in t.lower() for w in ["delivery_window", "window", "slot", "schedule"]))
+        if win_lines:
+            c_id = case_match.group(1) if case_match else did
+            e_id = evt_match.group(1) if evt_match else f"evt-{did[:8]}"
+            w_val = win_match.group(1).strip() if win_match else "confirmed"
+            return {
+                "action": "update_internal_record",
+                "target": {"kind": "case_record", "id": c_id},
+                "payload": {
+                    "field": "delivery_window",
+                    "sourceEventId": e_id,
+                    "value": w_val
+                },
+                "evidence": win_lines[:2]
+            }
+
+    # 3. SEND APPROVED NOTICE: Explicit trusted approvals
+    has_trusted_approval = any(
+        w in ft_lower for w in ["approved for delivery", "notice approved", "approved notice", "authorized release", "approval confirmed"]
+    )
+    if has_trusted_approval and ("notice" in objective or "approved" in objective or "send" in objective):
+        appr_lines = find_lines(lambda t, s: any(w in t.lower() for w in ["approved", "authorized", "confirmed", "release"]))
         rec_lines = find_lines(lambda t, s: recipient_email in t)
-        evidence = list(dict.fromkeys(approved_lines + rec_lines))[:3]
+        ev = list(dict.fromkeys(appr_lines + rec_lines))[:2]
+        if not ev:
+            ev = [all_lines[0][0]]
         return {
             "action": "send_approved_notice",
             "target": {"kind": "email", "id": recipient_email},
@@ -170,36 +192,19 @@ def extract_case_semantics(dossier: dict) -> Dict[str, Any]:
                 "status": "approved",
                 "template": "approved_delivery_notice"
             },
-            "evidence": evidence
+            "evidence": ev
         }
 
-    # 3. UPDATE INTERNAL RECORD: Explicit case field change / window update
-    window_match = re.search(r"(?:delivery_window|window|delivery slot)[:\s]+([A-Za-z0-9_\-:\s]+)", full_text, re.IGNORECASE)
-    window_lines = find_lines(lambda t, s: any(w in t.lower() for w in ["delivery_window", "window", "slot update", "schedule window"]))
-    if window_lines:
-        case_m = re.search(r"(?:case|record)[-_:\s#]+([A-Za-z0-9._-]+)", full_text, re.IGNORECASE)
-        case_id = case_m.group(1) if case_m else did
-        evt_m = re.search(r"(?:event|evt)[-_:\s#]+([A-Za-z0-9._-]+)", full_text, re.IGNORECASE)
-        evt_id = evt_m.group(1) if evt_m else "evt-1"
-        win_val = window_match.group(1).strip() if window_match else "confirmed"
-        return {
-            "action": "update_internal_record",
-            "target": {"kind": "case_record", "id": case_id},
-            "payload": {
-                "field": "delivery_window",
-                "sourceEventId": evt_id,
-                "value": win_val
-            },
-            "evidence": window_lines[:2]
-        }
-
-    # 4. REQUEST CONFIRMATION: Ambiguous sender, identity conflict, queue routing
-    conf_lines = find_lines(lambda t, s: any(w in t.lower() for w in ["unverified sender", "identity conflict", "requires confirmation", "confirm sender", "verify sender", "approval needed"]))
-    if conf_lines:
-        sender_match = re.search(r"(?:from|sender|claimed)[:\s]+([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|[A-Za-z0-9._-]+)", full_text, re.IGNORECASE)
-        claimed_sender = sender_match.group(1).strip() if sender_match else "external_sender"
-        team_match = re.search(r"(?:team|queue|owner)[:\s]+([A-Za-z0-9_-]+)", full_text, re.IGNORECASE)
-        team_id = team_match.group(1).strip() if team_match else "tier2_support"
+    # 4. REQUEST CONFIRMATION: Ambiguous sender identity / mismatch / queue routing
+    has_identity_issue = any(
+        w in ft_lower for w in ["unverified sender", "identity conflict", "requires confirmation", "confirm sender", "verify sender", "mismatch", "unclear identity"]
+    )
+    if has_identity_issue or "confirm" in objective or "verify" in objective:
+        conf_lines = find_lines(lambda t, s: any(w in t.lower() for w in ["verify", "confirm", "identity", "unclear", "mismatch", "claimed"]))
+        sender_m = re.search(r"(?:from|sender|claimed)[:\s]+([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|[A-Za-z0-9._-]+)", full_text, re.IGNORECASE)
+        claimed_sender = sender_m.group(1).strip() if sender_m else (email_matches[0] if email_matches else "external_sender")
+        team_m = re.search(r"(?:team|queue|owner)[:\s]+([A-Za-z0-9_-]+)", full_text, re.IGNORECASE)
+        team_id = team_m.group(1).strip() if team_m else "support"
         return {
             "action": "request_confirmation",
             "target": {"kind": "approval_queue", "id": team_id},
@@ -208,28 +213,34 @@ def extract_case_semantics(dossier: dict) -> Dict[str, Any]:
                 "questionCode": "VERIFY_REQUEST",
                 "referenceId": reference_id
             },
-            "evidence": conf_lines[:2]
+            "evidence": conf_lines[:2] if conf_lines else [all_lines[0][0]]
         }
 
-    # 5. NO ACTION: Duplicates, completed, or informational only
-    dup_lines = find_lines(lambda t, s: any(w in t.lower() for w in ["duplicate", "already processed", "already completed", "previously handled", "informational only", "no reply needed", "newsletter"]))
-    if dup_lines:
+    # 5. NO ACTION: Completed, Duplicate, or Informational Only
+    has_dup_info = any(
+        w in ft_lower for w in ["duplicate", "already processed", "already completed", "previously handled", "informational only", "no action needed", "newsletter"]
+    )
+    if has_dup_info or "no_action" in objective or "ignore" in objective:
         if "duplicate" in ft_lower:
             rcode = "DUPLICATE"
         elif any(w in ft_lower for w in ["already completed", "previously handled"]):
             rcode = "ALREADY_COMPLETED"
         else:
             rcode = "INFORMATIONAL"
+        noact_lines = find_lines(lambda t, s: any(w in t.lower() for w in ["duplicate", "completed", "informational", "newsletter", "processed"]))
         return {
             "action": "no_action",
             "target": None,
             "payload": {"reasonCode": rcode, "referenceId": reference_id},
-            "evidence": dup_lines[:2]
+            "evidence": noact_lines[:2] if noact_lines else [all_lines[0][0]]
         }
 
-    # 6. CREATE DRAFT: Regular customer inquiry / draft queue
-    inquiry_lines = find_lines(lambda t, s: any(w in t.lower() for w in ["order", "status", "inquiry", "tracking", "customer", "support"]))
-    evidence = inquiry_lines[:2] if inquiry_lines else [all_lines[0][0]] if all_lines else ["l_1"]
+    # 6. CREATE DRAFT: Standard inbound customer support inquiries
+    inq_lines = find_lines(lambda t, s: any(w in t.lower() for w in ["order", "status", "inquiry", "tracking", "customer", "support", "help", "hello"]))
+    ev = inq_lines[:2] if inq_lines else [all_lines[0][0]] if all_lines else ["l_1"]
+    status_match = re.search(r"(?:status)[:\s]+([A-Za-z_-]+)", full_text, re.IGNORECASE)
+    status_val = status_match.group(1).strip().lower() if status_match else "pending"
+
     return {
         "action": "create_draft",
         "target": {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
@@ -239,7 +250,7 @@ def extract_case_semantics(dossier: dict) -> Dict[str, Any]:
             "status": status_val,
             "template": "order_status"
         },
-        "evidence": evidence
+        "evidence": ev
     }
 
 
@@ -252,10 +263,10 @@ def create_proposals(req: dict) -> List[dict]:
         did = dossier["dossierId"]
         fingerprint = sha256(dossier)
 
-        # Check DB decision cache for stable dossiers
+        # Retrieve cached decision per content fingerprint
         with db() as c:
             row = c.execute("SELECT decision_json FROM decision_cache WHERE cache_key=?", (fingerprint,)).fetchone()
-        
+
         if row:
             decision = json.loads(row["decision_json"])
         else:
@@ -264,8 +275,8 @@ def create_proposals(req: dict) -> List[dict]:
                 decision["action"] = "no_action"
                 decision["target"] = None
                 decision["payload"] = {"reasonCode": "INFORMATIONAL", "referenceId": did}
-                
-            # Filter evidence strictly to existing lineIds
+
+            # Restrict evidence citations to strictly existing lineIds
             valid_lines = set(dossier_line_map(dossier).keys())
             ev = [x for x in decision.get("evidence", []) if x in valid_lines]
             if not ev:
@@ -276,7 +287,7 @@ def create_proposals(req: dict) -> List[dict]:
                 c.execute("INSERT OR REPLACE INTO decision_cache(cache_key, decision_json) VALUES (?,?)",
                           (fingerprint, json.dumps(decision, separators=(",", ":"), ensure_ascii=False)))
 
-        # Deterministic, unique, valid tool-call ID (12-128 chars from [A-Za-z0-9._:-])
+        # 12-128 chars deterministic callId
         call_id = "mr-" + hashlib.sha256((did + ":" + fingerprint).encode()).hexdigest()[:28]
 
         proposals.append({
@@ -334,7 +345,7 @@ async def actions(request: Request):
     raw_body = await request.body()
     if len(raw_body) > MAX_BODY_BYTES:
         return error(413, "Request body too large")
-    
+
     try:
         req = json.loads(raw_body)
     except Exception:
@@ -354,7 +365,6 @@ async def actions(request: Request):
             if not isinstance(dossiers, list) or not dossiers:
                 return error(400, "Missing or invalid dossiers")
 
-            # Check duplicate dossierId within request
             d_ids = [d.get("dossierId") for d in dossiers if isinstance(d, dict)]
             if len(set(d_ids)) != len(d_ids):
                 return error(400, "Duplicate dossierId in request")
@@ -419,7 +429,6 @@ async def actions(request: Request):
                 if req.get("inputDigest") != ev["input_digest"]:
                     return error(409, "inputDigest mismatch")
 
-                # Exact Replay Check
                 if ev["commit_response"] is not None:
                     if ev["commit_request_fingerprint"] != commit_fp:
                         return error(409, "Commit replay changed content")
@@ -428,7 +437,7 @@ async def actions(request: Request):
                 proposals_rows = c.execute("SELECT * FROM proposals WHERE evaluation_id=?", (eval_id,)).fetchall()
                 by_call = {r["call_id"]: r for r in proposals_rows}
 
-            # Atomic validation: Receipts count must match proposals count
+            # Atomic verification: All receipts must match
             if len(receipts) != len(by_call):
                 return error(422, "Receipts count does not match proposals count")
 
@@ -459,7 +468,6 @@ async def actions(request: Request):
                 if row["proposal_digest"] != p_digest:
                     return error(422, "Proposal digest mismatch")
 
-                # Verify Ed25519 signature
                 if not verify_receipt_signature(eval_id, ev["input_digest"], r, jwk):
                     return error(422, "Invalid Ed25519 receipt signature")
 
