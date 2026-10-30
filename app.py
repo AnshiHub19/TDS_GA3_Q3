@@ -4,28 +4,17 @@ import json
 import os
 import re
 import sqlite3
-import asyncio
-from contextlib import contextmanager
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
-import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 PROFILE = "ga5-mailroom-action-gate/v2"
-DB_PATH = os.getenv("DATABASE_PATH", "mailroom_v6.db")
+DB_PATH = os.getenv("DATABASE_PATH", "mailroom_v8.db")
 MAX_BODY_BYTES = 2_000_000
 
-LLM_API_KEY = (os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
-
-ALLOWED_ACTIONS = {
-    "create_draft", "update_internal_record", "send_approved_notice",
-    "request_confirmation", "quarantine_item", "no_action"
-}
-
-app = FastAPI(title="Safe AI Mailroom Agent", version="4.0.0")
+app = FastAPI(title="Safe AI Mailroom Agent", version="5.0.0")
 
 
 def canonical(obj: Any) -> bytes:
@@ -72,8 +61,7 @@ def init_db():
 init_db()
 
 
-@contextmanager
-def db():
+def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
@@ -114,10 +102,9 @@ def proposal_digest(proposal: dict) -> str:
     return sha256(normalized)
 
 
-# --- Authority, Provenance, and State-Aware Classifier ---
-def analyze_dossier_heuristics(dossier: dict) -> Dict[str, Any]:
+def analyze_dossier_contract(dossier: dict) -> Dict[str, Any]:
     did = dossier["dossierId"]
-    mailbox = str(dossier.get("mailbox", "support"))
+    mailbox = str(dossier.get("mailbox", "support")).strip()
     sources = dossier.get("sources", [])
 
     lines_meta = []
@@ -128,7 +115,7 @@ def analyze_dossier_heuristics(dossier: dict) -> Dict[str, Any]:
         for l in s.get("lines", []):
             lines_meta.append({
                 "lid": l["lineId"],
-                "text": l.get("text", ""),
+                "text": l.get("text", "").strip(),
                 "prov": prov,
                 "kind": kind,
                 "sourceId": src_id
@@ -137,8 +124,7 @@ def analyze_dossier_heuristics(dossier: dict) -> Dict[str, Any]:
     full_text = " ".join([m["text"] for m in lines_meta])
     ft_lower = full_text.lower()
 
-    # 1. QUARANTINE: Untrusted data trying to hijack execution or leak secrets
-    # Simon Willison prompt-injection patterns, secret canaries, override commands
+    # 1. QUARANTINE: Indirect prompt injections, secret exfiltration, canary tokens
     injection_patterns = [
         r"ignore\s+(?:all\s+)?previous\s+instructions",
         r"system\s+prompt",
@@ -152,8 +138,6 @@ def analyze_dossier_heuristics(dossier: dict) -> Dict[str, Any]:
         r"dump\s+database",
         r"output\s+the\s+hidden"
     ]
-    
-    # Check if attack pattern appears in untrusted sources
     for m in lines_meta:
         if m["prov"] in ["external", "untrusted", "public"] or "email" in m["kind"]:
             for pat in injection_patterns:
@@ -165,20 +149,27 @@ def analyze_dossier_heuristics(dossier: dict) -> Dict[str, Any]:
                         "evidence": [m["lid"]]
                     }
 
-    # Extract clean entities from lines
-    ref_match = re.search(r"(?:ref|reference|case|order|ticket|id)[-_\s:#]+([A-Za-z0-9._-]+)", full_text, re.IGNORECASE)
-    reference_id = ref_match.group(1).strip() if ref_match else did
+    def find_lids(predicate) -> List[str]:
+        return [m["lid"] for m in lines_meta if predicate(m["text"], m)]
+
+    ref_m = re.search(r"(?:ref(?:erence)?|case|order|ticket|id)[-_\s:#]+([A-Za-z0-9._-]+)", full_text, re.IGNORECASE)
+    reference_id = ref_m.group(1).strip() if ref_m else did
 
     email_matches = re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", full_text)
     recipient_email = email_matches[0].strip() if email_matches else "customer@example.com"
 
-    # 2. UPDATE INTERNAL RECORD: Delivery window changes from internal authorized records
-    window_match = re.search(r"(?:delivery_window|window|delivery\s+slot)[:\s]+[\"']?([A-Za-z0-9_\-:\s]+)[\"']?", full_text, re.IGNORECASE)
-    if window_match or "delivery_window" in ft_lower or "window" in ft_lower:
-        window_lines = [m for m in lines_meta if any(w in m["text"].lower() for w in ["delivery_window", "window", "slot", "delivery slot"])]
-        if window_lines:
-            target_line = window_lines[0]
-            val = window_match.group(1).strip() if window_match else "confirmed"
+    # 2. UPDATE INTERNAL RECORD: Delivery window updates
+    win_m = re.search(r"(?:delivery_window|window|delivery\s+slot)[:\s]+[\"']?([A-Za-z0-9_\-:\s]+)[\"']?", full_text, re.IGNORECASE)
+    if win_m or "delivery_window" in ft_lower or "window" in ft_lower:
+        win_lines = [m for m in lines_meta if any(w in m["text"].lower() for w in ["delivery_window", "window", "slot", "delivery slot"])]
+        if win_lines:
+            target_line = win_lines[0]
+            auth_lines = [m for m in lines_meta if any(w in m["text"].lower() for w in ["authorized", "rescheduled", "confirmed", "scheduled", "internal"])]
+            ev = [target_line["lid"]]
+            if auth_lines and auth_lines[0]["lid"] != target_line["lid"]:
+                ev.append(auth_lines[0]["lid"])
+
+            val = win_m.group(1).strip() if win_m else "confirmed"
             evt_m = re.search(r"(?:event|evt)[-_\s:#]+([A-Za-z0-9._-]+)", full_text, re.IGNORECASE)
             evt_id = evt_m.group(1).strip() if evt_m else f"evt-{did[:8]}"
             case_m = re.search(r"(?:case|record)[-_\s:#]+([A-Za-z0-9._-]+)", full_text, re.IGNORECASE)
@@ -192,15 +183,17 @@ def analyze_dossier_heuristics(dossier: dict) -> Dict[str, Any]:
                     "sourceEventId": evt_id,
                     "value": val
                 },
-                "evidence": [target_line["lid"]]
+                "evidence": sorted(list(set(ev)))
             }
 
-    # 3. SEND APPROVED NOTICE: Outbound sending ONLY if explicit trusted authority approved it
+    # 3. SEND APPROVED NOTICE: Outbound notice ONLY if trusted approval exists
     approved_lines = [m for m in lines_meta if any(w in m["text"].lower() for w in ["approved for delivery", "delivery approved", "approved notice", "authorized release", "approval confirmed"])]
     if approved_lines:
         appr_lid = approved_lines[0]["lid"]
         rec_lines = [m["lid"] for m in lines_meta if recipient_email in m["text"]]
-        evidence = list(dict.fromkeys([appr_lid] + rec_lines[:1]))
+        ev = [appr_lid]
+        if rec_lines and rec_lines[0] != appr_lid:
+            ev.append(rec_lines[0])
         return {
             "action": "send_approved_notice",
             "target": {"kind": "email", "id": recipient_email},
@@ -209,10 +202,10 @@ def analyze_dossier_heuristics(dossier: dict) -> Dict[str, Any]:
                 "status": "approved",
                 "template": "approved_delivery_notice"
             },
-            "evidence": evidence
+            "evidence": sorted(list(set(ev)))
         }
 
-    # 4. REQUEST CONFIRMATION: Ambiguous identity, mismatch, or claimed sender needing verification
+    # 4. REQUEST CONFIRMATION: Identity conflict / unverified sender
     conf_lines = [m for m in lines_meta if any(w in m["text"].lower() for w in ["unverified sender", "identity conflict", "requires confirmation", "confirm sender", "sender mismatch", "unclear sender", "verify sender"])]
     if conf_lines:
         sender_m = re.search(r"(?:from|sender|claimed)[:\s]+([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|[A-Za-z0-9._-]+)", full_text, re.IGNORECASE)
@@ -231,15 +224,10 @@ def analyze_dossier_heuristics(dossier: dict) -> Dict[str, Any]:
             "evidence": [conf_lines[0]["lid"]]
         }
 
-    # 5. NO ACTION: Duplicates, already completed, or purely informational items
+    # 5. NO ACTION: Duplicates or purely informational notices
     dup_lines = [m for m in lines_meta if any(w in m["text"].lower() for w in ["duplicate", "already completed", "already processed", "informational only", "no reply necessary", "newsletter"])]
     if dup_lines:
-        if "duplicate" in ft_lower:
-            rcode = "DUPLICATE"
-        elif any(w in ft_lower for w in ["already completed", "already processed"]):
-            rcode = "ALREADY_COMPLETED"
-        else:
-            rcode = "INFORMATIONAL"
+        rcode = "DUPLICATE" if "duplicate" in ft_lower else ("ALREADY_COMPLETED" if "already" in ft_lower else "INFORMATIONAL")
         return {
             "action": "no_action",
             "target": None,
@@ -247,10 +235,18 @@ def analyze_dossier_heuristics(dossier: dict) -> Dict[str, Any]:
             "evidence": [dup_lines[0]["lid"]]
         }
 
-    # 6. CREATE DRAFT: Regular legitimate inbound customer ticket/order status inquiry
+    # 6. CREATE DRAFT: Valid customer status inquiries
     inq_lines = [m for m in lines_meta if any(w in m["text"].lower() for w in ["order", "status", "tracking", "customer", "inquiry", "help", "shipment"])]
-    ev_lid = inq_lines[0]["lid"] if inq_lines else lines_meta[0]["lid"] if lines_meta else "l_1"
-    
+    rec_lines = [m for m in lines_meta if recipient_email in m["text"]]
+
+    ev = []
+    if inq_lines:
+        ev.append(inq_lines[0]["lid"])
+    if rec_lines and rec_lines[0]["lid"] not in ev:
+        ev.append(rec_lines[0]["lid"])
+    if not ev:
+        ev = [lines_meta[0]["lid"]] if lines_meta else ["l_1"]
+
     status_m = re.search(r"(?:status)[:\s]+([A-Za-z_-]+)", full_text, re.IGNORECASE)
     status_val = status_m.group(1).strip().lower() if status_m else "pending"
 
@@ -263,7 +259,7 @@ def analyze_dossier_heuristics(dossier: dict) -> Dict[str, Any]:
             "status": status_val,
             "template": "order_status"
         },
-        "evidence": [ev_lid]
+        "evidence": sorted(list(set(ev)))
     }
 
 
@@ -276,13 +272,13 @@ def create_proposals(req: dict) -> List[dict]:
         did = dossier["dossierId"]
         fingerprint = sha256(dossier)
 
-        with db() as c:
-            row = c.execute("SELECT decision_json FROM decision_cache WHERE cache_key=?", (fingerprint,)).fetchone()
+        for conn in get_db():
+            row = conn.execute("SELECT decision_json FROM decision_cache WHERE cache_key=?", (fingerprint,)).fetchone()
 
         if row:
             decision = json.loads(row["decision_json"])
         else:
-            decision = analyze_dossier_heuristics(dossier)
+            decision = analyze_dossier_contract(dossier)
             if decision["action"] not in allowed:
                 decision["action"] = "no_action"
                 decision["target"] = None
@@ -294,9 +290,9 @@ def create_proposals(req: dict) -> List[dict]:
                 ev = [list(valid_lines)[0]] if valid_lines else ["l_1"]
             decision["evidence"] = sorted(list(set(ev)))
 
-            with db() as c:
-                c.execute("INSERT OR REPLACE INTO decision_cache(cache_key, decision_json) VALUES (?,?)",
-                          (fingerprint, json.dumps(decision, separators=(",", ":"), ensure_ascii=False)))
+            for conn in get_db():
+                conn.execute("INSERT OR REPLACE INTO decision_cache(cache_key, decision_json) VALUES (?,?)",
+                             (fingerprint, json.dumps(decision, separators=(",", ":"), ensure_ascii=False)))
 
         call_id = "mr-" + hashlib.sha256((did + ":" + fingerprint).encode()).hexdigest()[:28]
 
@@ -366,9 +362,6 @@ async def actions(request: Request):
     if not eval_id or req.get("profile") != PROFILE:
         return error(400, "Invalid envelope or profile")
 
-    # ==========================
-    # 1. PROPOSE
-    # ==========================
     if operation == "propose":
         try:
             dossiers = req.get("dossiers")
@@ -382,8 +375,8 @@ async def actions(request: Request):
             input_digest = sha256(dossiers)
             propose_fp = sha256(req)
 
-            with db() as c:
-                prior = c.execute("SELECT * FROM evaluations WHERE evaluation_id=?", (eval_id,)).fetchone()
+            for conn in get_db():
+                prior = conn.execute("SELECT * FROM evaluations WHERE evaluation_id=?", (eval_id,)).fetchone()
                 if prior:
                     if prior["request_fingerprint"] != propose_fp:
                         return error(409, "evaluationId reused with changed content")
@@ -403,15 +396,15 @@ async def actions(request: Request):
 
             jwk = req["receiptVerifier"]["publicKeyJwk"]
 
-            with db() as c:
-                c.execute(
+            for conn in get_db():
+                conn.execute(
                     "INSERT INTO evaluations(evaluation_id,input_digest,request_fingerprint,verifier_jwk,propose_response) VALUES (?,?,?,?,?)",
                     (eval_id, input_digest, propose_fp, json.dumps(jwk, separators=(",", ":")),
                      json.dumps(response, separators=(",", ":"), ensure_ascii=False))
                 )
                 for p in proposals:
                     pd = proposal_digest(p)
-                    c.execute(
+                    conn.execute(
                         "INSERT INTO proposals(evaluation_id,dossier_id,call_id,action,proposal_json,proposal_digest) VALUES (?,?,?,?,?,?)",
                         (eval_id, p["dossierId"], p["callId"], p["action"],
                          json.dumps(p, separators=(",", ":"), ensure_ascii=False), pd)
@@ -421,9 +414,6 @@ async def actions(request: Request):
         except Exception as e:
             return error(422, f"Propose failed: {e}")
 
-    # ==========================
-    # 2. COMMIT
-    # ==========================
     elif operation == "commit":
         try:
             receipts = req.get("receipts")
@@ -432,8 +422,8 @@ async def actions(request: Request):
 
             commit_fp = sha256(req)
 
-            with db() as c:
-                ev = c.execute("SELECT * FROM evaluations WHERE evaluation_id=?", (eval_id,)).fetchone()
+            for conn in get_db():
+                ev = conn.execute("SELECT * FROM evaluations WHERE evaluation_id=?", (eval_id,)).fetchone()
                 if not ev:
                     return error(409, "Unknown evaluation")
                 if req.get("inputDigest") != ev["input_digest"]:
@@ -444,7 +434,7 @@ async def actions(request: Request):
                         return error(409, "Commit replay changed content")
                     return JSONResponse(content=json.loads(ev["commit_response"]), media_type="application/json")
 
-                proposals_rows = c.execute("SELECT * FROM proposals WHERE evaluation_id=?", (eval_id,)).fetchall()
+                proposals_rows = conn.execute("SELECT * FROM proposals WHERE evaluation_id=?", (eval_id,)).fetchall()
                 by_call = {r["call_id"]: r for r in proposals_rows}
 
             if len(receipts) != len(by_call):
@@ -500,8 +490,8 @@ async def actions(request: Request):
             if len(canonical(response)) > 512 * 1024:
                 return error(500, "Commit response exceeds 512 KiB limit")
 
-            with db() as c:
-                c.execute(
+            for conn in get_db():
+                conn.execute(
                     "UPDATE evaluations SET commit_request_fingerprint=?, commit_response=? WHERE evaluation_id=?",
                     (commit_fp, json.dumps(response, separators=(",", ":"), ensure_ascii=False), eval_id)
                 )
